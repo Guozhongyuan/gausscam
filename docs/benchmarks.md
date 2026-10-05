@@ -29,12 +29,32 @@ instead of dropping splats silently. Single 640x544 pinhole, 10 Hz loop:
 
 | scene | gaussians | cap | sort scratch | GPU latency | host CPU @ 10 Hz |
 |---|---|---|---|---|---|
-| map3 stairwell (DC-only PLY) | 983k | 4M | ~114 MB | 8.7 ms | 5% of one core |
-| church nave (full cloud) | 7.67M | 30.7M | ~878 MB | 48.4 ms | 5% of one core |
+| map3 stairwell (DC-only PLY) | 983k | 4M | ~114 MB | 9.4 ms | 5% of one core |
+| church nave (full cloud) | 7.67M | 30.7M | ~878 MB | 48.3 ms | 5% of one core |
 
 Host cost is scene-size independent (submit + two readbacks); GPU
-latency grows sublinearly with N (7.8x the gaussians, 5.6x the frame
+latency grows sublinearly with N (7.8x the gaussians, 5.1x the frame
 time). Pipeline init stays ~1 s at both sizes.
+
+### Before/after the adaptive capacity (0.1.1 vs 0.1.2)
+
+Same machine, back-to-back runs, single 640x544 pinhole, medians of
+repeated 40-frame batches (the HIL simulator was rendering on the same
+GPU throughout — absolute numbers drift a few percent, the deltas held):
+
+| case | 0.1.1 (fixed 4M cap) | 0.1.2 (adaptive cap) |
+|---|---|---|
+| map3 983k — fits the 4M cap | 8.4 ms/frame | 9.4 ms/frame |
+| church 2M subsample — fits the 4M cap | 14.5 ms/frame | 14.6 ms/frame |
+| church 7.67M full cloud | 92.8 ms/frame, **45.7% of pixels silently dropped** | 48.3 ms/frame, complete; overflow raises |
+
+Two findings. First, the price of the safety machinery on scenes that
+never overflow is ~0.9 ms/frame at a 4M cap (one extra 4-byte pair-count
+readback per frame plus grid-stride scatter) — under 1% of a 10 Hz frame
+budget; 2M-gaussian clouds are unaffected. Second, an overflowing scene
+on the fixed cap was not just incomplete but SLOWER (92.8 vs 48.3 ms):
+the rasterizer keeps churning through the dropped pairs' tile ranges.
+Sizing the capacity to the cloud fixed both.
 
 ## Correctness across vendors
 
