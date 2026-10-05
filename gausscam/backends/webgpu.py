@@ -20,26 +20,36 @@ from gausscam.backends._wgpu_base import make_K  # noqa: F401 -- re-export
 
 
 TILE = w2.TILE
-CAP = w2.CAP
-CHUNK = 1024                        # opt sweep block: 256 threads x 4 items
-BASE_CHUNKS = w2.N_CHUNKS           # 15625: base variant's 256-elem chunks
-CHUNKS_OPT = (CAP + CHUNK - 1) // CHUNK         # 3907 sweep blocks per pass
+CAP = w2.CAP                       # historical default capacity (4M pairs)
+CAP_MAX = 64_000_000               # capacity ceiling: ~1.8 GB of sort scratch
+CHUNK = 1024                       # opt sweep block: 256 threads x 4 items
 NPASS = w2.NPASS
-T_CHUNKS = 32                       # colscan tile: 32 chunks x 256 bins
-MAXB2 = (CHUNKS_OPT + T_CHUNKS - 1) // T_CHUNKS  # 123 block count ceiling
+T_CHUNKS = 32                      # colscan tile: 32 chunks x 256 bins
+
+
+def auto_capacity(n: int) -> int:
+    """Scene-sized (gaussian, tile) pair capacity for Pipeline(cap=None).
+
+    Every visible splat covers >= 1 tile, so pairs grow with the in-view
+    count; 4x N covers interior scenes with headroom (~2 pairs/gaussian
+    measured on a 7.7M church scan). Small scenes keep the historical 4M
+    footprint; the ceiling bounds pathological clouds.
+    """
+    return int(min(CAP_MAX, max(w2.CAP, 4 * int(n))))
 
 MARKER_BEFORE = {"rank_0": 1, "sweep_0": 1, "tile_starts": 2}
 
 
 # ---------------------------------------------------------------- WGSL ----- #
 
-def opt_radix_kernels(p: int) -> str:
+def opt_radix_kernels(p: int, chunks_opt: int) -> str:
     """L4 OneSweep pass (CUB/Orochi-style, clean-room WGSL): count -> bin_scan
     -> sweep. The sweep publishes per-block AGGREGATE digit counts, resolves
     its cross-block exclusive base per bin via decoupled look-back (spin on a
     2-state word), ranks elements with the order-contiguous group trick, and
     scatters — all in one dispatch. No hist2d matrix, no colscan chain.
-    Status arrays ping-pong by pass parity; both are re-zeroed each frame."""
+    Status arrays ping-pong by pass parity; both are re-zeroed each frame.
+    chunks_opt: sweep blocks per pass, from the Pipeline's pair capacity."""
     word_sel = "1u" if p < 4 else "0u"
     shift = 8 * (p % 4)
     src = "a" if p % 2 == 0 else "b"
@@ -48,16 +58,18 @@ def opt_radix_kernels(p: int) -> str:
     if p == 0:
         decl = (
             f"@group(0) @binding(34) var<storage, read_write> sw_status: "
-            f"array<atomic<u32>>;   // [{NPASS}*{CHUNKS_OPT}*256] lookback words\n"
+            f"array<atomic<u32>>;   // [{NPASS}*{chunks_opt}*256] lookback words\n"
             f"@group(0) @binding(35) var<storage, read_write> bin_cnt: "
             f"array<atomic<u32>>;   // [{NPASS}*256]\n"
             "\n// frame-start zero of all status planes + pass counters\n"
             "@compute @workgroup_size(256)\n"
             "fn zero_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-            "    let i = gid.x;\n"
-            f"    if (i < {NPASS * CHUNKS_OPT * 256}u) {{ atomicStore(&sw_status[i], 0u); }}\n"
-            f"    else if (i < {NPASS * CHUNKS_OPT * 256 + NPASS * 256}u) {{\n"
-            f"        atomicStore(&bin_cnt[i - {NPASS * CHUNKS_OPT * 256}u], 0u);\n"
+            f"    let stat_words = {NPASS * chunks_opt * 256}u;\n"
+            f"    let total = {NPASS * chunks_opt * 256 + NPASS * 256}u;\n"
+            "    // grid-stride: the status planes can outgrow one dispatch\n"
+            "    for (var i = gid.x; i < total; i += 16776960u) {\n"
+            "        if (i < stat_words) { atomicStore(&sw_status[i], 0u); }\n"
+            "        else { atomicStore(&bin_cnt[i - stat_words], 0u); }\n"
             "    }\n"
             "}\n")
     return decl + f"""
@@ -155,7 +167,7 @@ fn sweep_{p}(@builtin(workgroup_id) wgid: vec3<u32>,
         total = total + v;
     }}
     // publish AGGREGATE (state 1) for this block/bin
-    atomicExchange(&sw_status[par*{CHUNKS_OPT}u*256u + c*256u + lid.x],
+    atomicExchange(&sw_status[par*{chunks_opt}u*256u + c*256u + lid.x],
                    (1u << 30u) | total);
     // decoupled look-back: exclusive sum over predecessor blocks, bin lid.x
     var base = 0u;
@@ -163,15 +175,15 @@ fn sweep_{p}(@builtin(workgroup_id) wgid: vec3<u32>,
     loop {{
         if (j == 0u) {{ break; }}
         j = j - 1u;
-        var s = atomicLoad(&sw_status[par*{CHUNKS_OPT}u*256u + j*256u + lid.x]);
+        var s = atomicLoad(&sw_status[par*{chunks_opt}u*256u + j*256u + lid.x]);
         loop {{
             if ((s >> 30u) != 0u) {{ break; }}
-            s = atomicLoad(&sw_status[par*{CHUNKS_OPT}u*256u + j*256u + lid.x]);
+            s = atomicLoad(&sw_status[par*{chunks_opt}u*256u + j*256u + lid.x]);
         }}
         base = base + (s & 0x3fffffffu);
         if ((s >> 30u) == 2u) {{ break; }}   // PREFIX ends the walk
     }}
-    atomicExchange(&sw_status[par*{CHUNKS_OPT}u*256u + c*256u + lid.x],
+    atomicExchange(&sw_status[par*{chunks_opt}u*256u + c*256u + lid.x],
                    (2u << 30u) | (base + total));
     sw_lk_{p}[lid.x] = base;
     workgroupBarrier();
@@ -291,10 +303,11 @@ fn rasterize(@builtin(workgroup_id) wgid: vec3<u32>,
 """
 
 
-def optcol_radix_kernels(p: int) -> str:
+def optcol_radix_kernels(p: int, maxb2: int) -> str:
     """Arc/Mesa-safe fallback: group-rank + hierarchical colscan (no spin
     loops — look-back deadlocks the ARL/Mesa combination even at 2 blocks).
-    Same CHUNK=1024 geometry and fused structure as the OneSweep variant."""
+    Same CHUNK=1024 geometry and fused structure as the OneSweep variant.
+    maxb2: colscan block-count ceiling, from the Pipeline's capacity."""
     word_sel = "1u" if p < 4 else "0u"
     shift = 8 * (p % 4)
     src = "a" if p % 2 == 0 else "b"
@@ -304,7 +317,7 @@ def optcol_radix_kernels(p: int) -> str:
         decl = (
             f"@group(0) @binding(33) "
             f"var<storage, read_write> partials: array<atomic<u32>>;"
-            f"  // [{MAXB2}*256] colscan tile partials\n")
+            f"  // [{maxb2}*256] colscan tile partials\n")
     return decl + f"""
 fn digit_{p}(i: u32) -> u32 {{
     let word = keys_{src}[i*2u + {word_sel}];
@@ -396,7 +409,7 @@ fn colscan_a_{p}(@builtin(workgroup_id) wgid: vec3<u32>,
         cs_tile_{p}[idx] = acc;
         acc = acc + v;
     }}
-    atomicStore(&partials[b * {MAXB2}u + blk], acc);
+    atomicStore(&partials[b * {maxb2}u + blk], acc);
     workgroupBarrier();
     for (var i = 0u; i < {T_CHUNKS}u; i++) {{
         let c = c0 + i;
@@ -416,8 +429,8 @@ fn colscan_b_{p}(@builtin(workgroup_id) wgid: vec3<u32>) {{
     var blk = 0u;
     loop {{
         if (blk >= n_blocks) {{ break; }}
-        let v = atomicLoad(&partials[b * {MAXB2}u + blk]);
-        atomicStore(&partials[b * {MAXB2}u + blk], running);
+        let v = atomicLoad(&partials[b * {maxb2}u + blk]);
+        atomicStore(&partials[b * {maxb2}u + blk], running);
         running = running + v;
         blk = blk + 1u;
     }}
@@ -433,7 +446,7 @@ fn colscan_c_{p}(@builtin(workgroup_id) wgid: vec3<u32>,
     let n_chunks = (n + {CHUNK - 1}u) / {CHUNK}u;
     let n_blocks = (n_chunks + {T_CHUNKS - 1}u) / {T_CHUNKS}u;
     if (blk >= n_blocks) {{ return; }}
-    let base = atomicLoad(&partials[b * {MAXB2}u + blk]);
+    let base = atomicLoad(&partials[b * {maxb2}u + blk]);
     let c0 = blk * {T_CHUNKS}u;
     for (var i = 0u; i < {T_CHUNKS}u; i++) {{
         let c = c0 + i;
@@ -467,33 +480,45 @@ fn binscan_{p}(@builtin(local_invocation_id) lid: vec3<u32>) {{
 
 @compute @workgroup_size(256)
 fn scatter_{p}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
     let n = atomicLoad(&counts[P.c * P.tile_w * P.tile_h]);
-    if (i >= n) {{ return; }}
-    let c = i / {CHUNK}u;
-    let d = digit_{p}(i);
-    let pos = bin_base[d] + atomicLoad(&hist2d[c*256u + d]) + ranks[i];
-    keys_{dst}[pos*2u] = keys_{src}[i*2u];
-    keys_{dst}[pos*2u+1u] = keys_{src}[i*2u+1u];
-    flat_{dst}[pos] = flat_{src}[i];
+    // grid-stride: cap can push the 1-thread-per-entry dispatch past the
+    // 65535-workgroup WebGPU limit
+    for (var i = gid.x; i < n; i += 16776960u) {{
+        let c = i / {CHUNK}u;
+        let d = digit_{p}(i);
+        let pos = bin_base[d] + atomicLoad(&hist2d[c*256u + d]) + ranks[i];
+        keys_{dst}[pos*2u] = keys_{src}[i*2u];
+        keys_{dst}[pos*2u+1u] = keys_{src}[i*2u+1u];
+        flat_{dst}[pos] = flat_{src}[i];
+    }}
 }}
 """
 
 
-def build_wgsl(variant: str) -> str:
-    full = w2.WGSL
+def build_wgsl(variant: str, cap: int | None = None) -> str:
+    """cap: (gaussian, tile) pair capacity, baked into the isect-fill guard
+    and the sort kernels' chunk-plane sizes — every Pipeline compiles a
+    shader sized to its own scene. Defaults to the historical 4M."""
+    cap = w2.CAP if cap is None else int(cap)
+    chunks_opt = (cap + CHUNK - 1) // CHUNK
+    maxb2 = (chunks_opt + T_CHUNKS - 1) // T_CHUNKS
+    full = w2.WGSL.replace("const CAPACITY: u32 = 4000000u;",
+                           f"const CAPACITY: u32 = {cap}u;")
+    full = full.replace("const CAP_CHUNKS: u32 = 15625u;",
+                        f"const CAP_CHUNKS: u32 = {(cap + 255) // 256}u;")
     head = full[:full.index("fn digit_0(")]
     tail = full[full.index("// ---- tile starts"):]
     if variant == "base":
         radix = "".join(w2.radix_kernels(p) for p in range(NPASS))
         return head + radix + tail
-    elif variant in ("opt", "optcol"):
-        gen = opt_radix_kernels if variant == "opt" else optcol_radix_kernels
-        radix = "".join(gen(p) for p in range(NPASS))
-        tail_opt = tail[:tail.index("// ---- rasterize")] + FUSED_RASTERIZE
-        return head + radix + tail_opt
+    elif variant == "opt":
+        radix = "".join(opt_radix_kernels(p, chunks_opt) for p in range(NPASS))
+    elif variant == "optcol":
+        radix = "".join(optcol_radix_kernels(p, maxb2) for p in range(NPASS))
     else:
         raise ValueError(variant)
+    tail_opt = tail[:tail.index("// ---- rasterize")] + FUSED_RASTERIZE
+    return head + radix + tail_opt
 
 
 BASE_STEPS = ("zero_hist2d", "rank", "colscan", "binscan", "scatter")
@@ -508,9 +533,12 @@ class Pipeline:
     """FullGpuPipeline clone with selectable radix variant + optional
     timestamp-query device feature + partials buffer (binding 33)."""
 
-    def __init__(self, d, adapter_sub="", variant="opt", timestamp=False):
+    def __init__(self, d, adapter_sub="", variant="opt", timestamp=False,
+                 cap=None):
         """adapter_sub: substring of the Vulkan device name to pick ("nvidia",
-        "5070", ...); "" takes the first Vulkan adapter."""
+        "5070", ...); "" takes the first Vulkan adapter. cap: (gaussian, tile)
+        pair capacity -- defaults to scene-sized auto_capacity(N); pass a
+        smaller value to bound scratch on memory-limited devices."""
         self.variant = variant
         self.N = int(d["xyz"].shape[0])
         self.slots = d["slots"]
@@ -522,6 +550,17 @@ class Pipeline:
         self.tile_h = (self.H + TILE - 1) // TILE
         self.nt = self.tile_w * self.tile_h
         self.CN = self.C * self.N
+        self.cap = auto_capacity(self.N) if cap is None else int(cap)
+        if self.cap <= 0:
+            raise ValueError(f"cap must be positive, got {cap!r}")
+        if variant == "base" and self.cap > w2.CAP:
+            # the base radix keeps one-workgroup-per-chunk dispatches, which
+            # pass the 65535-workgroup WebGPU limit beyond 4M pairs
+            raise ValueError("base variant supports cap <= 4M; "
+                             "use 'opt' or 'optcol' for larger scenes")
+        chunks_opt = (self.cap + CHUNK - 1) // CHUNK
+        base_chunks = (self.cap + 255) // 256
+        maxb2 = (chunks_opt + T_CHUNKS - 1) // T_CHUNKS
 
         ads = [a for a in wgpu.gpu.enumerate_adapters_sync()
                if a.info["backend_type"] == "Vulkan"
@@ -586,20 +625,20 @@ class Pipeline:
         self.b_counts = mk((self.C * self.nt + 1) * 4)
         self.b_offsets = mk((self.C * self.nt + 1) * 4)
         self.b_cursors = mk((self.C * self.nt + 1) * 4)
-        self.b_keys_a = mk(CAP * 2 * 4)
-        self.b_flat_a = mk(CAP * 4)
-        self.b_keys_b = mk(CAP * 2 * 4)
-        self.b_flat_b = mk(CAP * 4)
-        self.b_hist2d = mk(BASE_CHUNKS * 256 * 4)  # 16MB: base zero range
+        self.b_keys_a = mk(self.cap * 2 * 4)
+        self.b_flat_a = mk(self.cap * 4)
+        self.b_keys_b = mk(self.cap * 2 * 4)
+        self.b_flat_b = mk(self.cap * 4)
+        self.b_hist2d = mk(base_chunks * 256 * 4)  # base variant zero range
         self.b_starts = mk((self.C * self.nt + 1) * 4)
         self.b_rgb = mk(self.C * self.H * self.W * 4)
         self.b_depth = mk(self.C * self.H * self.W * 4)
         self.b_renders = mk(self.C * self.H * self.W * 4 * 4)
-        self.b_ranks = mk(CAP * 4)
+        self.b_ranks = mk(self.cap * 4)
         self.b_coltot = mk(256 * 4)
         self.b_bin_base = mk(256 * 4)
-        self.b_partials = mk(MAXB2 * 256 * 4)
-        self.b_status = mk(NPASS * CHUNKS_OPT * 256 * 4)
+        self.b_partials = mk(maxb2 * 256 * 4)
+        self.b_status = mk(NPASS * chunks_opt * 256 * 4)
         self.b_bin_cnt = mk(NPASS * 256 * 4)
 
         u = np.zeros(16, np.uint32)
@@ -637,7 +676,7 @@ class Pipeline:
             {"binding": i, "resource": {"buffer": b, "offset": 0,
                                         "size": b.size}}
             for i, b in enumerate(self.bufs)])
-        module = dev.create_shader_module(code=build_wgsl(variant))
+        module = dev.create_shader_module(code=build_wgsl(variant, cap=self.cap))
         pl = dev.create_pipeline_layout(bind_group_layouts=[self.bgl])
 
         def pipe(entry):
@@ -673,26 +712,28 @@ class Pipeline:
                                    1, 1)
         for p in range(NPASS):
             if variant == "optcol":
-                self.wg[f"rank_{p}"] = (CHUNKS_OPT, 1, 1)
-                self.wg[f"colscan_a_{p}"] = (MAXB2, 1, 1)
+                self.wg[f"rank_{p}"] = (chunks_opt, 1, 1)
+                self.wg[f"colscan_a_{p}"] = (maxb2, 1, 1)
                 self.wg[f"colscan_b_{p}"] = (256, 1, 1)
-                self.wg[f"colscan_c_{p}"] = (MAXB2, 1, 1)
+                self.wg[f"colscan_c_{p}"] = (maxb2, 1, 1)
                 self.wg[f"binscan_{p}"] = (1, 1, 1)
-                self.wg[f"scatter_{p}"] = ((CAP + 255) // 256, 1, 1)
+                self.wg[f"scatter_{p}"] = (min((self.cap + 255) // 256,
+                                               65535), 1, 1)
             elif variant == "base":
-                self.wg[f"zero_hist2d_{p}"] = (
-                    (BASE_CHUNKS * 256 + 255) // 256, 1, 1)
-                self.wg[f"rank_{p}"] = (BASE_CHUNKS, 1, 1)
+                self.wg[f"zero_hist2d_{p}"] = (min(base_chunks, 65535), 1, 1)
+                self.wg[f"rank_{p}"] = (base_chunks, 1, 1)
                 self.wg[f"colscan_{p}"] = (256, 1, 1)
                 self.wg[f"binscan_{p}"] = (1, 1, 1)
-                self.wg[f"scatter_{p}"] = ((CAP + 255) // 256, 1, 1)
+                self.wg[f"scatter_{p}"] = (min((self.cap + 255) // 256,
+                                               65535), 1, 1)
             else:
-                self.wg[f"count_{p}"] = (CHUNKS_OPT, 1, 1)
+                self.wg[f"count_{p}"] = (chunks_opt, 1, 1)
                 self.wg[f"bin_scan_{p}"] = (1, 1, 1)
-                self.wg[f"sweep_{p}"] = (CHUNKS_OPT, 1, 1)
+                self.wg[f"sweep_{p}"] = (chunks_opt, 1, 1)
         if variant == "opt":
             self.wg["zero_sweep"] = (
-                (NPASS * CHUNKS_OPT * 256 + NPASS * 256 + 255) // 256, 1, 1)
+                min((NPASS * chunks_opt * 256 + NPASS * 256 + 255) // 256,
+                    65535), 1, 1)
         tail = ["tile_starts", "rasterize"]
         if variant == "base":
             tail.append("quantize")
@@ -735,6 +776,17 @@ class Pipeline:
             cp.dispatch_workgroups(*self.wg[name])
         cp.end()
         self.queue.submit([enc.finish()])
+        # capacity tripwire: scan_counts parks the TRUE pair total in counts'
+        # last cell even when isect_fill had to drop pairs past cap -- raise
+        # instead of shipping a frame with silent speckle holes.
+        n_pairs = int(np.frombuffer(self.queue.read_buffer(
+            self.b_counts, self.b_counts.size - 4, 4).cast("I"),
+            np.uint32)[0])
+        if n_pairs > self.cap:
+            raise RuntimeError(
+                f"isect overflow: {n_pairs:,} (gaussian, tile) pairs exceed "
+                f"cap {self.cap:,} -- raise Pipeline(cap=...) or subsample "
+                "the cloud")
         rgb = np.frombuffer(self.queue.read_buffer(self.b_rgb).cast("I"),
                             np.uint32)
         depth = np.frombuffer(self.queue.read_buffer(self.b_depth).cast("I"),
@@ -763,4 +815,5 @@ def pick_variant(sel: str) -> str:
 
 
 
-__all__ = ["Pipeline", "pick_variant", "build_wgsl", "make_K", "CAP", "TILE", "NPASS"]
+__all__ = ["Pipeline", "pick_variant", "build_wgsl", "make_K", "auto_capacity",
+           "CAP", "CAP_MAX", "TILE", "NPASS"]

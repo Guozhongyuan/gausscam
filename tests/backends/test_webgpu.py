@@ -20,7 +20,7 @@ if not has_vulkan:
     pytest.skip("no Vulkan adapter", allow_module_level=True)
 
 from gausscam.backends._wgpu_base import make_K  # noqa: E402
-from gausscam.backends.webgpu import Pipeline  # noqa: E402
+from gausscam.backends.webgpu import Pipeline, auto_capacity  # noqa: E402
 
 W = H = 64
 DIST = 5.0          # gaussian this far in front of the camera
@@ -124,6 +124,43 @@ def test_static_only_cloud():
     assert depth.shape == (1, H, W) and depth.dtype == np.uint16
     center = depth[0, H // 2, W // 2]
     assert center == pytest.approx(DIST * 1000, abs=800)   # mm
+
+
+def test_capacity_formula():
+    # small scenes keep the historical 4M footprint, big clouds scale at 4x N
+    assert auto_capacity(983_206) == 4_000_000
+    assert auto_capacity(7_669_453) == 4 * 7_669_453
+    assert auto_capacity(20_000_000) == 64_000_000        # clamped
+
+
+def test_explicit_cap():
+    pipe = Pipeline(_d(), "5070" if has_nvidia() else "", cap=8192)
+    assert pipe.cap == 8192
+    rgb_p, dep_p = pipe.render_frame()
+    rgb, depth = pipe.unpack(rgb_p, dep_p)
+    assert rgb.shape == (1, H, W, 3) and depth.shape == (1, H, W)
+
+
+def test_cap_overflow_raises():
+    # 4000 frame-filling splats at 64 px = 4000 x 16 tiles = 64k pairs against
+    # an 8192 capacity: isect_fill drops pairs silently, so the pair-total
+    # tripwire must raise instead of shipping a speckled frame
+    n = 4000
+    d = {
+        "xyz": np.full((n, 3), -5.0, np.float32),      # in front of the cam
+        "rot": np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+        "scale": np.full((n, 3), 3.0, np.float32),     # exp ~ 20 m: fills view
+        "opacity": np.full(n, 10.0, np.float32),
+        "sh": np.zeros((n, 3), np.float32),
+        "slots": np.zeros(0, np.int32),
+        "W": np.int32(W), "H": np.int32(H),
+        "fovy": np.float32(90.0),
+        "cam_pos": np.zeros((1, 3), np.float32),
+        "cam_xmat": np.eye(3, dtype=np.float32)[None],
+    }
+    pipe = Pipeline(d, "5070" if has_nvidia() else "", cap=8192)
+    with pytest.raises(RuntimeError, match="isect overflow"):
+        pipe.render_frame()
 
 
 def test_render_deterministic():

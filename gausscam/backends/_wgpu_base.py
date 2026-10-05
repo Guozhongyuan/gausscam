@@ -13,6 +13,11 @@ NPASS = 6                # 8-bit digits: 4x lo + 2x hi
 WGSL = """
 const SH0: f32 = 0.2820947917738781;
 const ALPHA_THRESHOLD: f32 = 0.00392156886;  // 1/255
+// (gaussian, tile) pair capacity for the isect fill; build_wgsl splices the
+// per-Pipeline value in place of this default.
+const CAPACITY: u32 = 4000000u;
+// base radix variant's hist2d chunk count (15625 = 4M / 256); spliced.
+const CAP_CHUNKS: u32 = 15625u;
 
 struct Params {
     n: u32, c: u32, w: u32, h: u32,
@@ -341,7 +346,7 @@ fn isect_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (ix >= w_) { break; }
             let tid = base + (y0 + iy) * P.tile_w + (x0 + ix);
             let pos = atomicAdd(&cursors[tid], 1u);
-            if (pos < 4000000u) {
+            if (pos < CAPACITY) {
                 keys_a[pos*2u] = (cam << bits) | (tid - base);
                 keys_a[pos*2u+1u] = lo;
                 flat_a[pos] = i32(idx);
@@ -372,7 +377,11 @@ fn digit_{p}(i: u32) -> u32 {{
 // hist2d must be zeroed each pass (rank atomicAdds into it)
 @compute @workgroup_size(256)
 fn zero_hist2d_{p}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    if (gid.x < 15625u * 256u) {{ atomicStore(&hist2d[gid.x], 0u); }}
+    // grid-stride: 65535 workgroups is the WebGPU dispatch limit
+    let total = CAP_CHUNKS * 256u;
+    for (var i = gid.x; i < total; i += 16776960u) {{
+        atomicStore(&hist2d[i], 0u);
+    }}
 }}
 
 // per-256-chunk: shared digits, in-order local ranks, chunk histogram
@@ -447,15 +456,17 @@ fn binscan_{p}(@builtin(local_invocation_id) lid: vec3<u32>) {{
 
 @compute @workgroup_size(256)
 fn scatter_{p}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
     let n = atomicLoad(&counts[P.c * P.tile_w * P.tile_h]);
-    if (i >= n) {{ return; }}
-    let c = i / 256u;
-    let d = digit_{p}(i);
-    let pos = bin_base[d] + hist2d[c*256u + d] + ranks[i];
-    keys_{dst}[pos*2u] = keys_{src}[i*2u];
-    keys_{dst}[pos*2u+1u] = keys_{src}[i*2u+1u];
-    flat_{dst}[pos] = flat_{src}[i];
+    // grid-stride: cap can push the 1-thread-per-entry dispatch past the
+    // 65535-workgroup WebGPU limit
+    for (var i = gid.x; i < n; i += 16776960u) {{
+        let c = i / 256u;
+        let d = digit_{p}(i);
+        let pos = bin_base[d] + hist2d[c*256u + d] + ranks[i];
+        keys_{dst}[pos*2u] = keys_{src}[i*2u];
+        keys_{dst}[pos*2u+1u] = keys_{src}[i*2u+1u];
+        flat_{dst}[pos] = flat_{src}[i];
+    }}
 }}
 """
 
