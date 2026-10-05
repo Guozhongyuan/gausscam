@@ -73,7 +73,7 @@ d = dict(
     scale=np.exp(g.scale).astype(np.float32),
     opacity=(1.0 / (1.0 + np.exp(-g.opacity))).astype(np.float32),
     sh=g.sh[:, :3],
-    slots=np.zeros(len(g.xyz), np.int32),   # whole cloud rides link slot 0
+    slots=np.zeros(0, np.int32),            # static-only cloud: no robot block
     W=np.int32(W), H=np.int32(H), fovy=np.float32(FOVY),
 )
 
@@ -86,9 +86,7 @@ d["cam_xmat"] = np.column_stack([right, up, -fwd]).astype(np.float32)[None]
 
 sub = "5070"                                    # substring of your GPU name
 pipe = Pipeline(d, sub, variant=pick_variant(sub))
-pipe.set_links(np.zeros((1, 3), np.float32),    # park slot 0 at identity
-               np.array([[1.0, 0, 0, 0]], np.float32))
-rgb, depth = pipe.unpack(*pipe.render_frame())
+rgb, depth = pipe.unpack(*pipe.render_frame())  # static: no set_links needed
 Image.fromarray(rgb[0]).save("render.png")
 ```
 
@@ -149,7 +147,7 @@ print(rgb.shape, depth.shape)   # (1, 240, 320, 3) uint8  (1, 240, 320) uint16 m
 
 For real scenes: `SceneSplat.load(ply)` + `RobotSplat.load_dir()` (needs
 `[io]`), merge with `gausscam.core.assets.merge`, feed the merged dict
-the same way.
+the same way (scene without a robot: empty `slots`, as above).
 
 ## Benchmarks
 
