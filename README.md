@@ -2,38 +2,26 @@
 
 3D Gaussian Splatting **sensor rendering** for physics simulators. The
 physics engine owns the world; gausscam turns a scene splat plus per-link
-robot splats into camera-frame sensor images (RGB + metric depth) — with
-**no PyTorch** and **one code path for every GPU vendor**.
+robot splats into camera-frame sensor images (RGB + metric depth).
 
 ## Why
 
-We built gausscam after fighting two recurring problems with the obvious
-stack (PyTorch + gsplat/CUDA) when rendering is only a *sensor* inside a
-simulation loop:
+Simulation hosts don't need a training stack, and sensor loops shouldn't
+break on vendor math libraries:
 
-**1. Lightweight.** A simulator host does not need a 2 GB training stack.
-gausscam is numpy + `wgpu-py` (Vulkan/Dawn/Metal) only — the whole wheel is
-a few hundred KB, `pip install gausscam[webgpu]` pulls no BLAS, no torch,
-no CUDA toolkit. CPU-side cost per frame is a sub-millisecond submit plus
-two small readbacks; everything else runs on the GPU.
+- **Lightweight** — numpy + `wgpu-py` only. No torch, no CUDA toolkit;
+  the wheel is a few hundred KB and host cost per frame is a
+  sub-millisecond submit plus two small readbacks.
+- **Every GPU vendor, one code path** — projection, sorting and blending
+  are hand-written WGSL (no cuBLAS/CUB). The same code runs on NVIDIA
+  discrete, Intel integrated and AMD (any conformant Vulkan driver),
+  bit-identical RGB across vendors (max diff 1/255 on 1.59M gaussians).
+  Device quirks are handled by shipping two sort variants and picking
+  per-vendor at startup.
 
-**2. Every GPU vendor, one code path.** The full pipeline (projection,
-depth sort, alpha blend) is hand-written WGSL — no cuBLAS/CUB, no vendor
-math libraries to break. The same unmodified code runs on NVIDIA
-discrete, Intel integrated and (via any conformant Vulkan driver) AMD
-GPUs, producing **bit-identical RGB** across vendors (verified: mean
-|ΔRGB| = 0.0003/255, max 1/255, on 1.59M gaussians). The known failure
-mode this avoids is real: Turing-era cublas `getrsBatched` segfaulted and
-corrupted contexts on a driver our first CUDA prototype depended on.
-Device quirks still exist (e.g. OneSweep look-back deadlocks Mesa/Intel),
-so the pipeline ships two sort variants and picks per-vendor at startup —
-but the *contract* never changes.
-
-What gausscam is *not*: a training or graphics tool. There is no
-optimization loop, no SSIM loss, no SIBR viewer. Inputs are **activated**
-3DGS values (scale in meters, opacity 0..1); outputs are `uint8` RGB and
-`uint16` millimeter depth, pixel-aligned with the simulated camera — the
-shape a robotics stack actually consumes.
+Not a training or graphics tool: inputs are **activated** 3DGS values,
+outputs are `uint8` RGB + `uint16` millimeter depth, pixel-aligned with
+the simulated camera.
 
 ## Layout
 
@@ -45,28 +33,24 @@ gausscam/
 │   ├── backend.py   RenderBackend protocol -> Frame(rgb u8, depth u16 mm)
 │   └── cull.py      SelfCull (hide the robot's own splats near a sensor)
 ├── backends/   the GPU axis
-│   └── webgpu.py    standalone wgpu pipeline (wgpu-py 0.32 → Vulkan;
-│                     OneSweep sort on NVIDIA, hierarchical scan
-│                     elsewhere; ~15 ms stereo @ 1.6M gaussians on an
-│                     RTX 5070). _wgpu_base.py carries the WGSL kernels.
+│   └── webgpu.py    wgpu pipeline (Vulkan; ~15 ms stereo @ 1.6M
+│                     gaussians on an RTX 5070). _wgpu_base.py has the
+│                     WGSL kernels.
 └── adapters/   the simulator axis (one pose contract)
     └── mujoco.py    mj_data.xpos/xquat (native wxyz) + cam_xpos/cam_xmat
     ( future: mjx batch / motrixsim / gazebo )
 ```
 
-Pose contract: `{link_name: (pos[3] f32, quat_wxyz[4] f32)}`.
-Per frame: `sim step → adapter.body_poses(...) → backend.set_links(...) →
+Pose contract: `{link_name: (pos[3] f32, quat_wxyz[4] f32)}`. Per frame:
+`sim step → adapter.body_poses(...) → backend.set_links(...) →
 backend.render(...) → numpy frames`.
 
-Install: `pip install gausscam` (core, numpy-only); add `[webgpu]` for the
-Vulkan render pipeline, `[mujoco]` for the adapter, `[io]` for 3DGS PLY
-loading.
+Install: `pip install gausscam` (core); add `[webgpu]` for the render
+pipeline, `[mujoco]` for the adapter, `[io]` for PLY loading.
 
 ## Example 1: render any 3DGS PLY (no simulator)
 
-`pip install "gausscam[webgpu,io,dev]"`, pick a viewpoint, render RGB + mm
-depth to disk. Works with any INRIA-layout `ply` (the standard output of
-3DGS training tools):
+`pip install "gausscam[webgpu,io,dev]"`, pick a viewpoint, render:
 
 ```python
 import numpy as np
@@ -106,22 +90,17 @@ pipe.set_links(np.zeros((1, 3), np.float32),    # park slot 0 at identity
                np.array([[1.0, 0, 0, 0]], np.float32))
 rgb, depth = pipe.unpack(*pipe.render_frame())
 Image.fromarray(rgb[0]).save("render.png")
-print("depth mm: p50", np.median(depth[0]), "max", depth[0].max())
 ```
 
-`pick_variant` keeps one code path per vendor (see Known device quirks in
-[docs/benchmarks.md](docs/benchmarks.md)); pass any substring of your
-adapter name as `sub`. Viewpoints outside the capture volume show the
-usual 3DGS fog — gausscam renders whatever the splats encode.
-
-Rendered with this snippet (983k-gaussian stairwell scan):
+Output (983k-gaussian stairwell scan; viewpoints outside the capture
+volume show the usual 3DGS fog):
 
 ![stairwell rendered from a 3DGS PLY](https://raw.githubusercontent.com/Guozhongyuan/gausscam/main/docs/images/ply-example.jpg)
 
-## Example 2: MuJoCo — a stepping box splat, 30 lines
+## Example 2: MuJoCo
 
-`pip install "gausscam[webgpu,mujoco]"`, then — the simulator owns the
-world, gausscam renders its sensor view of the splat:
+`pip install "gausscam[webgpu,mujoco]"` — the simulator owns the world,
+gausscam renders its sensor view of the splat:
 
 ```python
 import mujoco
@@ -142,7 +121,7 @@ model = mujoco.MjModel.from_xml_string("""
 </mujoco>""")
 data = mujoco.MjData(model)
 
-# three gaussians as the box's splat (slot 0 = its only link; no scene here)
+# three gaussians as the box's splat (slot 0 = its only link)
 N = 3
 d = dict(
     xyz=np.zeros((N, 3), np.float32),
@@ -155,7 +134,7 @@ d = dict(
     cam_pos=np.zeros((1, 3), np.float32),
     cam_xmat=np.eye(3, dtype=np.float32)[None],
 )
-ad, pipe = MuJoCoAdapter(model, data), Pipeline(d)       # first Vulkan device
+ad, pipe = MuJoCoAdapter(model, data), Pipeline(d)   # first Vulkan device
 
 data.qvel[0] = 0.5                          # slide the box along +x
 for _ in range(120):
@@ -168,26 +147,17 @@ for _ in range(120):
 print(rgb.shape, depth.shape)   # (1, 240, 320, 3) uint8  (1, 240, 320) uint16 mm
 ```
 
-The 3DGS dict fields are **activated** values — what the kernels consume:
-`scale` in meters, `opacity` in 0..1. (`GaussianCloud.from_ply` returns
-the raw INRIA PLY values, which are log-scale/logit; apply `exp`/`sigmoid`
-before feeding a Pipeline.) `slots[i]` assigns robot gaussian i to a link
-slot; `set_links` poses are per slot in `RobotSplat.link_names` order.
-
-For real scenes: load a captured scene with `SceneSplat.load(ply)` and
-robot links with `RobotSplat.load_dir()` (needs `[io]`), merge with
-`gausscam.core.assets.merge`, and feed the merged dict the same way.
+For real scenes: `SceneSplat.load(ply)` + `RobotSplat.load_dir()` (needs
+`[io]`), merge with `gausscam.core.assets.merge`, feed the merged dict
+the same way.
 
 ## Benchmarks
 
-`python -m gausscam.bench` renders a seeded synthetic scene (default
-200k gaussians, stereo 640x544) and checks geometric correctness; use it
-to verify a new GPU/driver before relying on it. Cross-vendor numbers and
-the bit-identical-output verification are in
-[docs/benchmarks.md](docs/benchmarks.md).
+`python -m gausscam.bench` renders a seeded synthetic scene and checks
+geometric correctness — run it to verify a new GPU/driver. Cross-vendor
+numbers: [docs/benchmarks.md](docs/benchmarks.md).
 
-## Licenses
+## License
 
-- gausscam: MIT (see `LICENSE`).
-- The WGSL kernels were clean-room written against the public 3DGS
-  equations; no INRIA/graphdeco code is included.
+MIT (see `LICENSE`). The WGSL kernels are clean-room written against the
+public 3DGS equations; no INRIA/graphdeco code is included.
