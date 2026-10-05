@@ -50,7 +50,9 @@ pipeline, `[mujoco]` for the adapter, `[io]` for PLY loading.
 
 ## Example 1: render any 3DGS PLY (no simulator)
 
-`pip install "gausscam[webgpu,io,dev]"`, pick a viewpoint, render:
+Standard INRIA and super-splat compressed PLYs are auto-detected from the
+vertex element. `pip install "gausscam[webgpu,io,dev]"`, pick a viewpoint,
+render:
 
 ```python
 import numpy as np

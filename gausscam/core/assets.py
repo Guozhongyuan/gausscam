@@ -35,9 +35,13 @@ class GaussianCloud:
 
     @classmethod
     def from_ply(cls, path: str | Path) -> "GaussianCloud":
-        """Read a 3DGS PLY (INRIA layout) returning the RAW stored values
-        (log-scale, logit-opacity) — apply exp/sigmoid before feeding a
-        Pipeline, whose kernels consume activated values. Needs the [io]
+        """Read a 3DGS PLY returning the RAW stored values (log-scale,
+        logit-opacity) — apply exp/sigmoid before feeding a Pipeline, whose
+        kernels consume activated values. Two layouts are auto-detected from
+        the vertex element: the standard INRIA layout, and the super-splat
+        compressed layout (quantized `chunk` + `packed_*` uint32 properties;
+        chunked min/max bounds, 11/10/11-bit positions and scales, 8-bit
+        colors/opacity, largest-component-index rotations). Needs the [io]
         extra (plyfile)."""
         try:
             from plyfile import PlyData
@@ -46,7 +50,15 @@ class GaussianCloud:
                 "GaussianCloud.from_ply needs a PLY reader: "
                 "pip install gausscam[io]"
             ) from exc
-        v = PlyData.read(str(path))["vertex"]
+        ply = PlyData.read(str(path))
+        v = ply["vertex"]
+        names = {p.name for p in v.properties}
+        if "packed_position" in names:
+            return cls._from_super_splat(ply, path)
+        return cls._from_inria(v, path)
+
+    @classmethod
+    def _from_inria(cls, v, path) -> "GaussianCloud":
         names = {p.name for p in v.properties}
 
         def prop(*keys: str) -> np.ndarray:
@@ -72,6 +84,109 @@ class GaussianCloud:
                                  np.float32),
             np.ascontiguousarray(np.asarray(v["opacity"]), np.float32),
             np.ascontiguousarray(sh, np.float32),
+        )
+
+    @classmethod
+    def _from_super_splat(cls, ply, path) -> "GaussianCloud":
+        """Decode the super-splat compressed layout back to RAW values: the
+        container stores ACTIVATED scale/opacity (exp/sigmoid applied at
+        encode time) quantized against per-chunk min/max, so scale goes back
+        through ln and opacity through logit."""
+        SH_C0 = 0.28209479177387814
+        vtx = ply["vertex"].data
+        chk = ply["chunk"].data
+        n = len(vtx)
+        if n == 0:
+            return cls(np.zeros((0, 3), np.float32),
+                       np.zeros((0, 4), np.float32),
+                       np.zeros((0, 3), np.float32),
+                       np.zeros((0,), np.float32),
+                       np.zeros((0, 3), np.float32))
+        ci = np.clip(np.arange(n, dtype=np.int64) // 256, 0, len(chk) - 1)
+
+        def chunk(field: str) -> np.ndarray:
+            return np.asarray(chk[field])[ci]
+
+        # positions: 11/10/11 bits against per-chunk float bounds (values)
+        pp = vtx["packed_position"].astype(np.uint32)
+        xyz = np.stack([
+            ((pp >> 21) & 0x7FF).astype(np.float32) / 2047.0
+            * (chunk("max_x") - chunk("min_x")) + chunk("min_x"),
+            ((pp >> 11) & 0x3FF).astype(np.float32) / 1023.0
+            * (chunk("max_y") - chunk("min_y")) + chunk("min_y"),
+            (pp & 0x7FF).astype(np.float32) / 2047.0
+            * (chunk("max_z") - chunk("min_z")) + chunk("min_z"),
+        ], axis=1)
+
+        # scales: same 11/10/11 layout against LOG-scale bounds; the decoded
+        # values are already the RAW log-scale the dataclass contract wants
+        ps = vtx["packed_scale"].astype(np.uint32)
+        scale = np.stack([
+            ((ps >> 21) & 0x7FF).astype(np.float32) / 2047.0
+            * (chunk("max_scale_x") - chunk("min_scale_x")) + chunk("min_scale_x"),
+            ((ps >> 11) & 0x3FF).astype(np.float32) / 1023.0
+            * (chunk("max_scale_y") - chunk("min_scale_y")) + chunk("min_scale_y"),
+            (ps & 0x7FF).astype(np.float32) / 2047.0
+            * (chunk("max_scale_z") - chunk("min_scale_z")) + chunk("min_scale_z"),
+        ], axis=1)
+
+        # colors: 8-bit against per-chunk bounds in SH-DC-RGB space
+        # (f_dc * SH_C0 + 0.5); invert to RAW f_dc. alpha carries the
+        # ACTIVATED opacity -> logit back to RAW.
+        pc = vtx["packed_color"].astype(np.uint32)
+        rgb = np.stack([
+            ((pc >> 24) & 0xFF).astype(np.float32) / 255.0
+            * (chunk("max_r") - chunk("min_r")) + chunk("min_r"),
+            ((pc >> 16) & 0xFF).astype(np.float32) / 255.0
+            * (chunk("max_g") - chunk("min_g")) + chunk("min_g"),
+            ((pc >> 8) & 0xFF).astype(np.float32) / 255.0
+            * (chunk("max_b") - chunk("min_b")) + chunk("min_b"),
+        ], axis=1)
+        f_dc = (rgb - 0.5) / SH_C0
+        p_opa = ((pc & 0xFF).astype(np.float32) / 255.0).clip(1e-6, 1.0 - 1e-6)
+        opacity = np.log(p_opa / (1.0 - p_opa))
+
+        # rotations: largest-component index (2 bits) + 3x10-bit magnitudes
+        # for the remaining components, in wxyz order; the largest component
+        # is reconstructed positive-normalized (the encode side flips sign
+        # so this loses only a global sign, which does not affect rotation)
+        pr = vtx["packed_rotation"].astype(np.uint32)
+        largest = (pr >> 30) & 0x3
+        vals = np.stack([(pr >> 20) & 0x3FF, (pr >> 10) & 0x3FF,
+                         pr & 0x3FF], axis=1).astype(np.float32)
+        vals = (vals / 1023.0 - 0.5) / (np.sqrt(2.0) * 0.5)
+        q = np.zeros((n, 4), np.float32)
+        m = [largest == k for k in range(4)]
+        comp = [(1, 2, 3), (0, 2, 3), (0, 1, 3), (0, 1, 2)]
+        for k in range(4):
+            for slot, axis in enumerate(comp[k]):
+                q[m[k], axis] = vals[m[k], slot]
+        rest_sq = np.sum(q * q, axis=1)
+        big = np.sqrt(np.clip(1.0 - rest_sq, 0.0, 1.0)).astype(np.float32)
+        for k in range(4):
+            q[m[k], k] = big[m[k]]
+
+        # optional high-order SH element: uint8 planar (R..., G..., B...),
+        # de-quantized to (u8 / 256 - 0.5) * 8 and re-interleaved to the
+        # dataclass (RGB, RGB...) layout; DC comes from packed_color above
+        f_rest = np.zeros((n, 0), np.float32)
+        if "sh" in [e.name for e in ply.elements]:
+            sh_el = ply["sh"]
+            rest_names = [p.name for p in sh_el.properties
+                          if p.name.startswith("f_rest_")]
+            if rest_names:
+                raw = np.stack([np.asarray(sh_el[nm]) for nm in rest_names],
+                               axis=1).astype(np.float32)
+                f_rest = ((raw / 256.0 - 0.5) * 8.0).reshape(n, 3, -1)
+                f_rest = f_rest.transpose(0, 2, 1).reshape(n, -1)
+        sh = np.ascontiguousarray(np.concatenate([f_dc, f_rest], axis=1))
+
+        return cls(
+            np.ascontiguousarray(xyz, np.float32),
+            np.ascontiguousarray(q, np.float32),
+            np.ascontiguousarray(scale, np.float32),
+            np.ascontiguousarray(opacity, np.float32),
+            sh,
         )
 
 
