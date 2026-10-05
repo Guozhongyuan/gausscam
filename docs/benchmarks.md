@@ -20,6 +20,22 @@ frame submit-only 0.67 ms, two `map_read` readbacks dominate the
 GPU-serial tail. Rate-limited to 15 Hz the process costs 7-9% of one
 core — cheap enough to sit beside a 200 Hz controller.
 
+## Scene size (adaptive capacity, RTX 5070 Laptop)
+
+The (gaussian, tile) pair capacity scales with the cloud —
+`auto_capacity(N) = clamp(4·N, 4M, 64M)`, override with
+`Pipeline(cap=...)` — and a pair-count tripwire raises on overflow
+instead of dropping splats silently. Single 640x544 pinhole, 10 Hz loop:
+
+| scene | gaussians | cap | sort scratch | GPU latency | host CPU @ 10 Hz |
+|---|---|---|---|---|---|
+| map3 stairwell (DC-only PLY) | 983k | 4M | ~114 MB | 8.7 ms | 5% of one core |
+| church nave (full cloud) | 7.67M | 30.7M | ~878 MB | 48.4 ms | 5% of one core |
+
+Host cost is scene-size independent (submit + two readbacks); GPU
+latency grows sublinearly with N (7.8x the gaussians, 5.6x the frame
+time). Pipeline init stays ~1 s at both sizes.
+
 ## Correctness across vendors
 
 Same WGSL, same inputs (1.59M gaussians), NVIDIA vs Intel:
@@ -45,8 +61,8 @@ within 1/255.
   fine) → the bench default uses the proven n=200k scene so one config
   passes on every vendor.
 - Resolution is fully runtime-parameterized; the (gaussian, tile) pair
-  capacity of 4M covers up to ~800x720 at that scene density (1088x960
-  needs 8M).
+  capacity auto-scales with the cloud (`auto_capacity(N)`, clamp
+  [4M, 64M], `Pipeline(cap=...)` overrides) and overflowing it raises.
 
 ## Scaling notes
 

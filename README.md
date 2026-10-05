@@ -90,10 +90,11 @@ rgb, depth = pipe.unpack(*pipe.render_frame())  # static: no set_links needed
 Image.fromarray(rgb[0]).save("render.png")
 ```
 
-Output (983k-gaussian stairwell scan; viewpoints outside the capture
-volume show the usual 3DGS fog):
+Output (7.7M-gaussian church scan rendered at the simulation spawn with
+the full cloud; viewpoints outside the capture volume show the usual
+3DGS fog):
 
-![stairwell rendered from a 3DGS PLY](https://raw.githubusercontent.com/Guozhongyuan/gausscam/main/docs/images/ply-example.jpg)
+![church nave rendered from a 3DGS PLY](https://raw.githubusercontent.com/Guozhongyuan/gausscam/main/docs/images/church-example.jpg)
 
 ## Example 2: MuJoCo
 
