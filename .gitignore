@@ -1,0 +1,28 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# virtualenvs
+.venv*/
+venv/
+
+# tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# local experiment outputs
+examples/
+out/
+render.png
+MUJOCO_LOG.TXT
+
+# editors
+.vscode/
+.idea/

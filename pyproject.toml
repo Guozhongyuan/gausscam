@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gausscam"
+version = "0.1.0"
+description = "3D Gaussian Splatting sensor rendering for physics simulators (torch-free backends, MuJoCo adapter)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Homepage = "https://github.com/Guozhongyuan/gausscam"
+Source = "https://github.com/Guozhongyuan/gausscam"
+
+[project.optional-dependencies]
+mujoco = ["mujoco>=3.2"]
+webgpu = ["wgpu>=0.32,<0.33"]
+io = ["plyfile"]
+dev = ["pillow", "plyfile", "pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "gpu: needs a Vulkan-capable device (skipped when none is visible)",
+]
+
+[tool.setuptools.packages.find]
+include = ["gausscam*"]
