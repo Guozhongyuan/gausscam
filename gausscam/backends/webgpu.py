@@ -42,30 +42,31 @@ MARKER_BEFORE = {"rank_0": 1, "sweep_0": 1, "tile_starts": 2}
 
 # ---------------------------------------------------------------- WGSL ----- #
 
-def opt_radix_kernels(p: int, chunks_opt: int) -> str:
+def opt_radix_kernels(p: int, chunks_opt: int, npass: int) -> str:
     """L4 OneSweep pass (CUB/Orochi-style, clean-room WGSL): count -> bin_scan
     -> sweep. The sweep publishes per-block AGGREGATE digit counts, resolves
     its cross-block exclusive base per bin via decoupled look-back (spin on a
     2-state word), ranks elements with the order-contiguous group trick, and
     scatters — all in one dispatch. No hist2d matrix, no colscan chain.
     Status arrays ping-pong by pass parity; both are re-zeroed each frame.
-    chunks_opt: sweep blocks per pass, from the Pipeline's pair capacity."""
-    word_sel = "1u" if p < 4 else "0u"
-    shift = 8 * (p % 4)
+    chunks_opt: sweep blocks per pass, from the Pipeline's pair capacity.
+    Keys are single u32 words packed as (tile<<16 | depth16); npass = 8-bit
+    digits needed to cover the significant width."""
+    shift = 8 * p
     src = "a" if p % 2 == 0 else "b"
     dst = "b" if p % 2 == 0 else "a"
     decl = ""
     if p == 0:
         decl = (
             f"@group(0) @binding(34) var<storage, read_write> sw_status: "
-            f"array<atomic<u32>>;   // [{NPASS}*{chunks_opt}*256] lookback words\n"
+            f"array<atomic<u32>>;   // [{npass}*{chunks_opt}*256] lookback words\n"
             f"@group(0) @binding(35) var<storage, read_write> bin_cnt: "
-            f"array<atomic<u32>>;   // [{NPASS}*256]\n"
+            f"array<atomic<u32>>;   // [{npass}*256]\n"
             "\n// frame-start zero of all status planes + pass counters\n"
             "@compute @workgroup_size(256)\n"
             "fn zero_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-            f"    let stat_words = {NPASS * chunks_opt * 256}u;\n"
-            f"    let total = {NPASS * chunks_opt * 256 + NPASS * 256}u;\n"
+            f"    let stat_words = {npass * chunks_opt * 256}u;\n"
+            f"    let total = {npass * chunks_opt * 256 + npass * 256}u;\n"
             "    // grid-stride: the status planes can outgrow one dispatch\n"
             "    for (var i = gid.x; i < total; i += 16776960u) {\n"
             "        if (i < stat_words) { atomicStore(&sw_status[i], 0u); }\n"
@@ -74,8 +75,7 @@ def opt_radix_kernels(p: int, chunks_opt: int) -> str:
             "}\n")
     return decl + f"""
 fn digit_{p}(i: u32) -> u32 {{
-    let word = keys_{src}[i*2u + {word_sel}];
-    return (word >> {shift}u) & 0xffu;
+    return (keys_{src}[i] >> {shift}u) & 0xffu;
 }}
 
 var<workgroup> sw_dig_{p}: array<u32, {CHUNK}>;         // digits, element order
@@ -206,8 +206,7 @@ fn sweep_{p}(@builtin(workgroup_id) wgid: vec3<u32>,
         let d = sw_dig_{p}[il];
         if (d != 0xffffffffu) {{
             let pos = bin_base[d] + sw_lk_{p}[d] + sw_rank_{p}[il];
-            keys_{dst}[pos*2u] = keys_{src}[(start + il)*2u];
-            keys_{dst}[pos*2u+1u] = keys_{src}[(start + il)*2u+1u];
+            keys_{dst}[pos] = keys_{src}[start + il];
             flat_{dst}[pos] = flat_{src}[start + il];
         }}
     }}
@@ -307,9 +306,9 @@ def optcol_radix_kernels(p: int, maxb2: int) -> str:
     """Arc/Mesa-safe fallback: group-rank + hierarchical colscan (no spin
     loops — look-back deadlocks the ARL/Mesa combination even at 2 blocks).
     Same CHUNK=1024 geometry and fused structure as the OneSweep variant.
-    maxb2: colscan block-count ceiling, from the Pipeline's capacity."""
-    word_sel = "1u" if p < 4 else "0u"
-    shift = 8 * (p % 4)
+    maxb2: colscan block-count ceiling, from the Pipeline's capacity.
+    Keys are single u32 words packed as (tile<<16 | depth16)."""
+    shift = 8 * p
     src = "a" if p % 2 == 0 else "b"
     dst = "b" if p % 2 == 0 else "a"
     decl = ""
@@ -320,8 +319,7 @@ def optcol_radix_kernels(p: int, maxb2: int) -> str:
             f"  // [{maxb2}*256] colscan tile partials\n")
     return decl + f"""
 fn digit_{p}(i: u32) -> u32 {{
-    let word = keys_{src}[i*2u + {word_sel}];
-    return (word >> {shift}u) & 0xffu;
+    return (keys_{src}[i] >> {shift}u) & 0xffu;
 }}
 
 var<workgroup> rk_digits_{p}: array<u32, {CHUNK}>;
@@ -487,19 +485,25 @@ fn scatter_{p}(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let c = i / {CHUNK}u;
         let d = digit_{p}(i);
         let pos = bin_base[d] + atomicLoad(&hist2d[c*256u + d]) + ranks[i];
-        keys_{dst}[pos*2u] = keys_{src}[i*2u];
-        keys_{dst}[pos*2u+1u] = keys_{src}[i*2u+1u];
+        keys_{dst}[pos] = keys_{src}[i];
         flat_{dst}[pos] = flat_{src}[i];
     }}
 }}
 """
 
 
-def build_wgsl(variant: str, cap: int | None = None) -> str:
+def build_wgsl(variant: str, cap: int | None = None, npass: int | None = None,
+               static_cloud: bool = False) -> str:
     """cap: (gaussian, tile) pair capacity, baked into the isect-fill guard
     and the sort kernels' chunk-plane sizes — every Pipeline compiles a
-    shader sized to its own scene. Defaults to the historical 4M."""
+    shader sized to its own scene. Defaults to the historical 4M.
+    npass: 8-bit radix passes; defaults to 4 (covers the 32-bit packed key).
+    The key packs as (tile << 16 | depth16): 16 + tile_bits + log2(C) bits.
+    static_cloud: robot-less clouds read xyz_o/rot_o directly in project, so
+    update_links' full-cloud copy is skipped (caller drops the dispatch).
+    """
     cap = w2.CAP if cap is None else int(cap)
+    npass = 4 if npass is None else int(npass)
     chunks_opt = (cap + CHUNK - 1) // CHUNK
     maxb2 = (chunks_opt + T_CHUNKS - 1) // T_CHUNKS
     full = w2.WGSL.replace("const CAPACITY: u32 = 4000000u;",
@@ -509,15 +513,34 @@ def build_wgsl(variant: str, cap: int | None = None) -> str:
     head = full[:full.index("fn digit_0(")]
     tail = full[full.index("// ---- tile starts"):]
     if variant == "base":
-        radix = "".join(w2.radix_kernels(p) for p in range(NPASS))
+        radix = "".join(w2.radix_kernels(p) for p in range(npass))
         return head + radix + tail
     elif variant == "opt":
-        radix = "".join(opt_radix_kernels(p, chunks_opt) for p in range(NPASS))
+        radix = "".join(opt_radix_kernels(p, chunks_opt, npass)
+                        for p in range(npass))
     elif variant == "optcol":
-        radix = "".join(optcol_radix_kernels(p, maxb2) for p in range(NPASS))
+        radix = "".join(optcol_radix_kernels(p, maxb2) for p in range(npass))
     else:
         raise ValueError(variant)
     tail_opt = tail[:tail.index("// ---- rasterize")] + FUSED_RASTERIZE
+    if static_cloud:
+        # project is the only consumer of xyz_c/rot_c once self_cull is a
+        # no-op (robot_n == 0); point it at the original arrays and never
+        # dispatch update_links. Rewrite ONLY the project fn: update_links
+        # stays referencing the (unused) xyz_c copy target, which keeps the
+        # module compiling -- xyz_o is a read-only binding there.
+        fn_a = head.index("fn project(")
+        fn_b = head.index("// ---- isect count")
+        proj = head[fn_a:fn_b].replace("xyz_c[", "xyz_o[").replace(
+            "rot_c[", "rot_o[")
+        head = head[:fn_a] + proj + head[fn_b:]
+    # the radix scatters ping-pong between the key/flat buffer pairs; after
+    # npass passes the sorted arrays live in a (even pass count) or b (odd).
+    # tile_starts binary-searches the final keys and rasterize stages the
+    # final flats -- point both at whichever buffer holds them.
+    final = "a" if npass % 2 == 0 else "b"
+    tail_opt = tail_opt.replace("keys_a[mid]", f"keys_{final}[mid]")
+    tail_opt = tail_opt.replace("flat_a[idx]", f"flat_{final}[idx]")
     return head + radix + tail_opt
 
 
@@ -561,6 +584,16 @@ class Pipeline:
         chunks_opt = (self.cap + CHUNK - 1) // CHUNK
         base_chunks = (self.cap + 255) // 256
         maxb2 = (chunks_opt + T_CHUNKS - 1) // T_CHUNKS
+        # radix passes over the 32-bit packed key (tile << 16 | depth16):
+        # 16 depth bits + ceil(log2(tiles)) tile bits + ceil(log2(C)) cam bits
+        key_bits = 16 + int(np.ceil(np.log2(max(self.nt, 2)))) \
+            + max(0, int(np.ceil(np.log2(max(self.C, 1)))))
+        if key_bits > 32:
+            raise ValueError(
+                f"packed sort key needs {key_bits} bits (> 32): resolution "
+                f"{self.W}x{self.H} with {self.C} camera(s) too large")
+        self.npass = (key_bits + 7) // 8
+        self.static_cloud = self.robot_n == 0
 
         ads = [a for a in wgpu.gpu.enumerate_adapters_sync()
                if a.info["backend_type"] == "Vulkan"
@@ -625,9 +658,9 @@ class Pipeline:
         self.b_counts = mk((self.C * self.nt + 1) * 4)
         self.b_offsets = mk((self.C * self.nt + 1) * 4)
         self.b_cursors = mk((self.C * self.nt + 1) * 4)
-        self.b_keys_a = mk(self.cap * 2 * 4)
+        self.b_keys_a = mk(self.cap * 4)
         self.b_flat_a = mk(self.cap * 4)
-        self.b_keys_b = mk(self.cap * 2 * 4)
+        self.b_keys_b = mk(self.cap * 4)
         self.b_flat_b = mk(self.cap * 4)
         self.b_hist2d = mk(base_chunks * 256 * 4)  # base variant zero range
         self.b_starts = mk((self.C * self.nt + 1) * 4)
@@ -638,8 +671,8 @@ class Pipeline:
         self.b_coltot = mk(256 * 4)
         self.b_bin_base = mk(256 * 4)
         self.b_partials = mk(maxb2 * 256 * 4)
-        self.b_status = mk(NPASS * chunks_opt * 256 * 4)
-        self.b_bin_cnt = mk(NPASS * 256 * 4)
+        self.b_status = mk(self.npass * chunks_opt * 256 * 4)
+        self.b_bin_cnt = mk(self.npass * 256 * 4)
 
         u = np.zeros(16, np.uint32)
         u[:8] = (self.N, self.C, self.W, self.H, self.tile_w,
@@ -676,7 +709,9 @@ class Pipeline:
             {"binding": i, "resource": {"buffer": b, "offset": 0,
                                         "size": b.size}}
             for i, b in enumerate(self.bufs)])
-        module = dev.create_shader_module(code=build_wgsl(variant, cap=self.cap))
+        module = dev.create_shader_module(code=build_wgsl(
+            variant, cap=self.cap, npass=self.npass,
+            static_cloud=self.static_cloud))
         pl = dev.create_pipeline_layout(bind_group_layouts=[self.bgl])
 
         def pipe(entry):
@@ -692,25 +727,28 @@ class Pipeline:
             names.append("zero_sweep")
         steps = (BASE_STEPS if variant == "base" else
                  OPT_STEPS if variant == "opt" else OPTCOL_STEPS)
-        for p in range(NPASS):
+        for p in range(self.npass):
             names.extend(f"{s}_{p}" for s in steps)
         self.pipes = {name: pipe(name) for name in names}
 
         self.wg = {
-            "update_links": ((self.N + 255) // 256, 1, 1),
+            # grid-stride: clamped to the WebGPU dispatch limit
+            "update_links": (min((self.N + 255) // 256, 65535), 1, 1),
             "self_cull": ((self.robot_n + 255) // 256, 1, 1),
-            "project": ((self.CN + 255) // 256, 1, 1),
-            "isect_count": ((self.CN + 255) // 256, 1, 1),
+            # per-(cam, gaussian) kernels are grid-stride: clamp every
+            # dispatch to the WebGPU 65535-workgroup limit
+            "project": (min((self.CN + 255) // 256, 65535), 1, 1),
+            "isect_count": (min((self.CN + 255) // 256, 65535), 1, 1),
             "zero_counts": ((self.C * self.nt + 1 + 255) // 256, 1, 1),
             "scan_counts": (1, 1, 1),
-            "isect_fill": ((self.CN + 255) // 256, 1, 1),
+            "isect_fill": (min((self.CN + 255) // 256, 65535), 1, 1),
             "tile_starts": ((self.C * self.nt + 1 + 255) // 256, 1, 1),
             "rasterize": (self.C * self.nt, 1, 1),
         }
         if variant == "base":
             self.wg["quantize"] = ((self.C * self.H * self.W + 255) // 256,
                                    1, 1)
-        for p in range(NPASS):
+        for p in range(self.npass):
             if variant == "optcol":
                 self.wg[f"rank_{p}"] = (chunks_opt, 1, 1)
                 self.wg[f"colscan_a_{p}"] = (maxb2, 1, 1)
@@ -732,8 +770,8 @@ class Pipeline:
                 self.wg[f"sweep_{p}"] = (chunks_opt, 1, 1)
         if variant == "opt":
             self.wg["zero_sweep"] = (
-                min((NPASS * chunks_opt * 256 + NPASS * 256 + 255) // 256,
-                    65535), 1, 1)
+                min((self.npass * chunks_opt * 256 + self.npass * 256
+                     + 255) // 256, 65535), 1, 1)
         tail = ["tile_starts", "rasterize"]
         if variant == "base":
             tail.append("quantize")
@@ -741,7 +779,13 @@ class Pipeline:
                 "isect_count", "scan_counts", "isect_fill"]
         if variant == "opt":
             head.append("zero_sweep")
-        self.order = head + [f"{s}_{p}" for p in range(NPASS) for s in steps] + tail
+        if self.static_cloud:
+            # project reads xyz_o/rot_o directly: the copy kernels would only
+            # re-write the scene block with identical values
+            head = [k for k in head if k not in ("update_links", "self_cull")]
+        self.order = (head
+                      + [f"{s}_{p}" for p in range(self.npass)
+                         for s in steps] + tail)
 
     def set_links(self, pos, quat):
         links = np.zeros((13, 8), np.float32)

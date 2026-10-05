@@ -67,8 +67,8 @@ fn tile_bits() -> u32 {
 // ---- pose refresh: copy scene block, rigid-transform robot block ----
 @compute @workgroup_size(256)
 fn update_links(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let g = gid.x;
-    if (g >= P.n) { return; }
+    // grid-stride: one thread per gaussian, CN can exceed one dispatch
+    for (var g = gid.x; g < P.n; g += 16776960u) {
     if (g < P.scene_n) {
         xyz_c[g*3u] = xyz_o[g*3u];
         xyz_c[g*3u+1u] = xyz_o[g*3u+1u];
@@ -77,7 +77,7 @@ fn update_links(@builtin(global_invocation_id) gid: vec3<u32>) {
         rot_c[g*4u+1u] = rot_o[g*4u+1u];
         rot_c[g*4u+2u] = rot_o[g*4u+2u];
         rot_c[g*4u+3u] = rot_o[g*4u+3u];
-        return;
+        continue;
     }
     let k = g - P.scene_n;
     let b = u32(slots[k]);
@@ -101,6 +101,7 @@ fn update_links(@builtin(global_invocation_id) gid: vec3<u32>) {
     rot_c[g*4u+1u] = w1*x2 + x1*w2 + y1*z2 - z1*y2;
     rot_c[g*4u+2u] = w1*y2 - x1*z2 + y1*w2 + z1*x2;
     rot_c[g*4u+3u] = w1*z2 + x1*y2 - y1*x2 + z1*w2;
+    }
 }
 
 // ---- self cull: zero opacity of robot gaussians near the origin ----
@@ -121,8 +122,8 @@ fn self_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ---- project + degree-0 colors + opacity broadcast (validated in W1) ----
 @compute @workgroup_size(256)
 fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if (idx >= P.c * P.n) { return; }
+    // grid-stride: one thread per (cam, gaussian); CN can exceed one dispatch
+    for (var idx = gid.x; idx < P.c * P.n; idx += 16776960u) {
     let g = idx % P.n;
     let cam = idx / P.n;
     let vm = cam * 16u;
@@ -233,19 +234,20 @@ fn project(@builtin(global_invocation_id) gid: vec3<u32>) {
     colors[idx*4u+2u] = col.z;
     colors[idx*4u+3u] = out_depth;
     opacity_b[idx] = opa[g];
+    }
 }
 
 // ---- isect count: tile ranges + per-tile atomic counts ----
 @compute @workgroup_size(256)
 fn isect_count(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if (idx >= P.c * P.n) { return; }
+    // grid-stride: one thread per (cam, gaussian)
+    for (var idx = gid.x; idx < P.c * P.n; idx += 16776960u) {
     let rx = radii[idx*2u];
     let ry = radii[idx*2u+1u];
     if (rx <= 0 || ry <= 0) {
         ranges[idx*4u] = 0u; ranges[idx*4u+1u] = 0u;
         ranges[idx*4u+2u] = 0u; ranges[idx*4u+3u] = 0u;
-        return;
+        continue;
     }
     let trx = f32(rx) / 16.0;
     let trY = f32(ry) / 16.0;
@@ -273,6 +275,7 @@ fn isect_count(@builtin(global_invocation_id) gid: vec3<u32>) {
             ix = ix + 1u;
         }
         iy = iy + 1u;
+    }
     }
 }
 
@@ -327,16 +330,23 @@ fn scan_counts(@builtin(local_invocation_id) lid: vec3<u32>) {
 // ---- fill: expand ranges into (key, flat) pairs ----
 @compute @workgroup_size(256)
 fn isect_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if (idx >= P.c * P.n) { return; }
+    // grid-stride: one thread per (cam, gaussian)
+    for (var idx = gid.x; idx < P.c * P.n; idx += 16776960u) {
     let w_ = ranges[idx*4u+2u];
     let h_ = ranges[idx*4u+3u];
-    if (w_ == 0u || h_ == 0u) { return; }
+    if (w_ == 0u || h_ == 0u) { continue; }
     let x0 = ranges[idx*4u];
     let y0 = ranges[idx*4u+1u];
     let cam = idx / P.n;
     let bits = tile_bits();
-    let lo = bitcast<u32>(depths[idx]);
+    // packed single-u32 sort key: (tile << 16 | depth16). The 16-bit depth
+    // quantization matches the output contract (mm, 0..65.535 m) and keeps
+    // every sort pass moving one word; sub-mm-coincident splats may swap
+    // order, which changes only sub-1/255 rounding in their blend. A
+    // sqrt-encoded 12-bit variant (3 radix passes instead of 4, ~8% faster)
+    // was tested and REJECTED: the 16-24 mm far-field quantization reordered
+    // enough splat pairs that 2-6% of pixels shifted >1/255 (gate: >=99%).
+    let d16 = u32(clamp(depths[idx], 0.0, 65.535) * 1000.0);
     let base = cam * (P.tile_w * P.tile_h);
     var iy = 0u;
     loop {
@@ -347,13 +357,13 @@ fn isect_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
             let tid = base + (y0 + iy) * P.tile_w + (x0 + ix);
             let pos = atomicAdd(&cursors[tid], 1u);
             if (pos < CAPACITY) {
-                keys_a[pos*2u] = (cam << bits) | (tid - base);
-                keys_a[pos*2u+1u] = lo;
+                keys_a[pos] = (((cam << bits) | (tid - base)) << 16u) | d16;
                 flat_a[pos] = i32(idx);
             }
             ix = ix + 1u;
         }
         iy = iy + 1u;
+    }
     }
 }
 """
@@ -362,16 +372,13 @@ fn isect_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
 def radix_kernels(p: int) -> str:
     """STABLE 8-bit-digit pass: zero hist2d -> rank (in-chunk,
     order-preserving) -> per-chunk column scan -> bin base scan -> scatter."""
-    # keys layout: keys[2i] = hi, keys[2i+1] = lo. Digits LSB-first:
-    # p0..p3 = lo bytes, p4..p5 = hi bytes.
-    word_sel = "1u" if p < 4 else "0u"
-    shift = 8 * (p % 4)
+    # single-u32 packed key (tile << 16 | depth16); digits LSB-first.
+    shift = 8 * p
     src = "a" if p % 2 == 0 else "b"
     dst = "b" if p % 2 == 0 else "a"
     return f"""
 fn digit_{p}(i: u32) -> u32 {{
-    let word = keys_{src}[i*2u + {word_sel}];
-    return (word >> {shift}u) & 0xffu;
+    return (keys_{src}[i] >> {shift}u) & 0xffu;
 }}
 
 // hist2d must be zeroed each pass (rank atomicAdds into it)
@@ -463,8 +470,7 @@ fn scatter_{p}(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let c = i / 256u;
         let d = digit_{p}(i);
         let pos = bin_base[d] + hist2d[c*256u + d] + ranks[i];
-        keys_{dst}[pos*2u] = keys_{src}[i*2u];
-        keys_{dst}[pos*2u+1u] = keys_{src}[i*2u+1u];
+        keys_{dst}[pos] = keys_{src}[i];
         flat_{dst}[pos] = flat_{src}[i];
     }}
 }}
@@ -491,7 +497,7 @@ fn tile_starts(@builtin(global_invocation_id) gid: vec3<u32>) {
     loop {
         if (lo >= hi) { break; }
         let mid = (lo + hi) / 2u;
-        if (keys_a[mid*2u] < tgt) { lo = mid + 1u; }
+        if (keys_a[mid] >> 16u < tgt) { lo = mid + 1u; }
         else { hi = mid; }
     }
     starts[i] = i32(lo);
