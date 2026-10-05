@@ -58,16 +58,21 @@ Sizing the capacity to the cloud fixed both.
 
 ### Supported scale
 
-Hard limit as shipped, verified empirically on the 5070: the
+Hard limit as shipped, verified empirically: the
 one-thread-per-(cam, gaussian) kernels dispatch C·N/256 workgroups and
 WebGPU caps a dispatch dimension at 65,535, so **C·N ≤ 16,776,960
 gaussians** — 16.8M mono, 8.4M stereo. N = 16,776,960 mono passes (cap
 clamps to 64M, ~3.8 GB VRAM total); N = 17.0M fails device validation.
-The 7.67M church scene sits at 46% (mono) / 91% (stereo) of that budget.
-Going bigger means grid-striding the four per-gaussian kernels (same
-pattern as the sort kernels); after that the pair cap tops out at
-67.1M pairs (65,535 sort blocks) and VRAM becomes the binding
-constraint.
+The boundary is **vendor-independent**: confirmed identical on the
+RTX 5070 (OneSweep) and the Intel ARL Mesa iGPU (hierarchical scan) —
+16,776,960 passes, 17.0M fails with the same error — because it comes
+from the WebGPU dispatch maximum, not the hardware. What DOES scale
+with the card is VRAM feasibility (~3.8 GB at the mono boundary) and
+speed (7x between the two cards above). The 7.67M church scene sits at
+46% (mono) / 91% (stereo) of that budget. Going bigger means
+grid-striding the four per-gaussian kernels (same pattern as the sort
+kernels); after that the pair cap tops out at 67.1M pairs (65,535 sort
+blocks) and VRAM becomes the binding constraint.
 
 ## Correctness across vendors
 
