@@ -560,7 +560,14 @@ class Pipeline:
                 f"d['sh'] must be (N, 3) DC coefficients, got {sh.shape}; "
                 "slice a from_ply() block to sh[:, :3]")
         self.b_sh = put(sh)
-        self.b_slots = put(self.slots)
+        # Robot-less clouds (static scene only) carry an empty slots array;
+        # wgpu rejects zero-byte buffers, so park a 4-byte placeholder.
+        # update_links never reads it: with scene_n == N every gaussian takes
+        # the copy path, and self_cull dispatches 0 workgroups.
+        if self.robot_n:
+            self.b_slots = put(self.slots)
+        else:
+            self.b_slots = dev.create_buffer(size=4, usage=ST | CS)
         self.b_links = dev.create_buffer(
             size=13 * 8 * 4,
             usage=ST | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)

@@ -96,6 +96,36 @@ def test_center_depth_matches_true_distance():
     assert depth.min() > 1000               # nothing at the near plane
 
 
+def test_static_only_cloud():
+    """slots = empty (no robot block): wgpu rejects zero-byte buffers, so
+    the pipeline parks a placeholder; every gaussian takes the copy path
+    and renders exactly like a scene-head-only cloud."""
+    n = 8
+    d = {
+        "xyz": np.tile([[0.0, 0.0, -DIST]], (n, 1)).astype(np.float32),
+        "rot": np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+        "scale": np.full((n, 3), -2.3, np.float32),   # exp ~ 0.1 m
+        "opacity": np.full(n, 10.0, np.float32),      # ~opaque
+        "sh": np.zeros((n, 3), np.float32),
+        "slots": np.zeros(0, np.int32),
+        "W": np.int32(W), "H": np.int32(H),
+        "fovy": np.float32(90.0),
+        "cam_pos": np.zeros((1, 3), np.float32),
+        "cam_xmat": np.eye(3, dtype=np.float32)[None],
+    }
+    pipe = Pipeline(d, "5070" if has_nvidia() else "")
+    # identity link poses: the links buffer is still written every frame
+    pipe.set_links(
+        np.zeros((13, 3), np.float32),
+        np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (13, 1)))
+    rgb_p, dep_p = pipe.render_frame()
+    rgb, depth = pipe.unpack(rgb_p, dep_p)
+    assert rgb.shape == (1, H, W, 3) and rgb.dtype == np.uint8
+    assert depth.shape == (1, H, W) and depth.dtype == np.uint16
+    center = depth[0, H // 2, W // 2]
+    assert center == pytest.approx(DIST * 1000, abs=800)   # mm
+
+
 def test_render_deterministic():
     d = _d()
     pf, _ = _pose_at(DIST)
