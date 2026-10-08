@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gausscam"
-version = "0.1.4"
+dynamic = ["version"]
 description = "3D Gaussian Splatting sensor rendering for physics simulators (torch-free backends, MuJoCo adapter)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,9 @@ testpaths = ["tests"]
 markers = [
   "gpu: needs a Vulkan-capable device (skipped when none is visible)",
 ]
+
+[tool.setuptools.dynamic]
+version = { attr = "gausscam.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["gausscam*"]
